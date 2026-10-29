@@ -1,0 +1,13 @@
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index cd1bca7ed..5eab7b61f 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -2413,7 +2413,7 @@ static int __iommu_device_set_domain(struct iommu_group *group,
+ 	     new_domain == group->blocking_domain)) {
+ 		dev_warn(dev,
+ 			 "Firmware has requested this device have a 1:1 IOMMU mapping, rejecting configuring the device without a 1:1 mapping. Contact your platform vendor.\n");
+-		return -EINVAL;
++		//return -EINVAL;
+ 	}
+ 
+ 	if (dev->iommu->attach_deferred) {

@@ -1,0 +1,25 @@
+diff --git a/src/xt.c b/src/xt.c
+index f7bee21..1c01570 100644
+--- a/src/xt.c
++++ b/src/xt.c
+@@ -10,6 +10,10 @@
+ #include <nft.h>
+ 
+ #include <time.h>
++
++#ifdef HAVE_LIBXTABLES
++#include <xtables.h>
++
+ #include <net/if.h>
+ #include <getopt.h>
+ #include <ctype.h>	/* for isspace */
+@@ -26,9 +30,6 @@
+ #include <linux/netfilter_arp/arp_tables.h>
+ #include <linux/netfilter_bridge/ebtables.h>
+ 
+-#ifdef HAVE_LIBXTABLES
+-#include <xtables.h>
+-
+ static void *xt_entry_alloc(const struct xt_stmt *xt, uint32_t af);
+ #endif
+ 

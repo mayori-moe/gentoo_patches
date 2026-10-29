@@ -1,0 +1,82 @@
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 7d59d301e..903bebcc5 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1182,6 +1182,7 @@ static void init_vmcb(struct kvm_vcpu *vcpu, bool init_event)
+ 	svm_set_intercept(svm, INTERCEPT_ICEBP);
+ 	svm_set_intercept(svm, INTERCEPT_RDPRU);
+ 	svm_set_intercept(svm, INTERCEPT_RSM);
++	svm_set_intercept(svm, INTERCEPT_RDTSC);
+ 
+ 	if (!kvm_mwait_in_guest(vcpu->kvm)) {
+ 		svm_set_intercept(svm, INTERCEPT_MONITOR);
+@@ -3344,6 +3345,39 @@ static int vmmcall_interception(struct kvm_vcpu *vcpu)
+ 	return kvm_emulate_hypercall(vcpu);
+ }
+ 
++static int handle_rdtsc_interception(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 rdtsc_real = rdtsc();
++
++	if(unlikely(!svm->rdtsc_initialized))
++	{
++		svm->rdtsc_fake = rdtsc_real;
++		svm->rdtsc_initialized = true;
++	}
++
++	if(svm->rdtsc_prev != 0)
++	{
++		if(rdtsc_real > svm->rdtsc_prev)
++		{
++			u64 diff = rdtsc_real - svm->rdtsc_prev;
++			u64 fake_diff =  diff / 20;
++			svm->rdtsc_fake += fake_diff;
++		}
++	}
++	if(svm->rdtsc_fake > rdtsc_real)
++
++	{
++		svm->rdtsc_fake = rdtsc_real;
++	}
++	svm->rdtsc_prev = rdtsc_real;
++
++	vcpu->arch.regs[VCPU_REGS_RAX] = svm->rdtsc_fake & -1u;
++	vcpu->arch.regs[VCPU_REGS_RDX] = (svm->rdtsc_fake >> 32) & -1u;
++
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
+ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[SVM_EXIT_READ_CR0]			= cr_interception,
+ 	[SVM_EXIT_READ_CR3]			= cr_interception,
+@@ -3420,12 +3454,14 @@ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[SVM_EXIT_AVIC_UNACCELERATED_ACCESS]	= avic_unaccelerated_access_interception,
+ #ifdef CONFIG_KVM_AMD_SEV
+ 	[SVM_EXIT_VMGEXIT]			= sev_handle_vmgexit,
++	[SVM_EXIT_RDTSC]			= handle_rdtsc_interception,
+ #endif
+ };
+ 
+ static void dump_vmcb(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++
+ 	struct vmcb_control_area *control = &svm->vmcb->control;
+ 	struct vmcb_save_area *save = &svm->vmcb->save;
+ 	struct vmcb_save_area *save01 = &svm->vmcb01.ptr->save;
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index e958943b8..a839471f2 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -368,6 +368,10 @@ struct vcpu_svm {
+ 
+ 	/* Guest GIF value, used when vGIF is not enabled */
+ 	bool guest_gif;
++
++	u64 rdtsc_fake;
++	u64 rdtsc_prev;
++	bool rdtsc_initialized;
+ };
+ 
+ struct svm_cpu_data {
