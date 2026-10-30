@@ -1,9 +1,14 @@
-From a313c009a3a5c77acf8e0af916aefcaa94e8654d Mon Sep 17 00:00:00 2001
+From bf1bbcc8a5434352b4a8d6f5f104044d8b5efa05 Mon Sep 17 00:00:00 2001
 From: closure <closure@localhost>
-Date: Wed, 28 Oct 2026 00:05:01 +0800
+Date: Fri, 30 Oct 2026 16:38:45 +0800
 Subject: [PATCH] Add rpmalloc 2.0.2 for musl
+Co-Author: DeepSeek-v4.1-Flash
 
 Update the bundled rpmalloc from 1.4.5 to 2.0.2 (develop b8455bb) and adapt the musl integration to the new API: initialize with an empty memory interface, drop the set_main_thread hook, use the new rpmalloc_thread_finalize signature, and keep the per-thread heap and deferred free chain in struct pthread instead of TLS.
+
+Restore the main thread TSD array before using the rpmalloc pthread key. The loader can rebuild the initial TLS after the key was created when a loaded DSO has TLS, leaving the new main thread pthread without a tsd array.
+
+Advise the kernel not to back page-type spans with transparent huge pages unless THP was explicitly requested. With THP set to always, each 256MiB aligned span can otherwise charge a 2MiB huge page for its metadata, adding gigabytes of RSS on systems with many threads. Large/huge block mappings keep THP.
 ---
  Makefile                       |    2 +-
  README                         |    2 +
@@ -12,11 +17,11 @@ Update the bundled rpmalloc from 1.4.5 to 2.0.2 (develop b8455bb) and adapt the 
  src/env/__libc_start_main.c    |    4 +
  src/internal/pthread_impl.h    |    9 +
  src/malloc/lite_malloc.c       |    5 +
- src/malloc/rpmalloc/glue.h     |   56 +
- src/malloc/rpmalloc/rpmalloc.c | 4809 ++++++++++++++++++++++++++++++++
+ src/malloc/rpmalloc/glue.h     |   63 +
+ src/malloc/rpmalloc/rpmalloc.c | 4820 ++++++++++++++++++++++++++++++++
  src/malloc/rpmalloc/rpmalloc.h |  427 +++
  src/thread/pthread_create.c    |    7 +
- 11 files changed, 5333 insertions(+), 1 deletion(-)
+ 11 files changed, 5351 insertions(+), 1 deletion(-)
  create mode 100644 src/malloc/rpmalloc/glue.h
  create mode 100644 src/malloc/rpmalloc/rpmalloc.c
  create mode 100644 src/malloc/rpmalloc/rpmalloc.h
@@ -151,10 +156,10 @@ index 43a988f..ae0f637 100644
 +weak_alias(dummy, __malloc_thread_finalize);
 diff --git a/src/malloc/rpmalloc/glue.h b/src/malloc/rpmalloc/glue.h
 new file mode 100644
-index 0000000..d899cd6
+index 0000000..2f332d9
 --- /dev/null
 +++ b/src/malloc/rpmalloc/glue.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,63 @@
 +#include "rpmalloc.h"
 +#if (defined(__GNUC__) && __GNUC__ >= 9)
 +  #pragma GCC diagnostic ignored "-Wattributes"  // or we get warnings that nodiscard is ignored on a forward
@@ -208,15 +213,22 @@ index 0000000..d899cd6
 +	context->heap = heap;
 +	if (heap && heap->id)
 +		heap->owner_thread = get_thread_id();
-+	if (pthread_key_created)
++	if (pthread_key_created) {
++		pthread_t self = __pthread_self();
++		/* The loader may rebuild the initial TLS after the allocator key was
++		   created (when a loaded DSO has TLS), leaving the new main thread
++		   pthread without a TSD array. Restore the one pthread_key_create
++		   would have used. */
++		if (!self->tsd) self->tsd = __pthread_tsd_main;
 +		pthread_setspecific(pthread_key, heap);
++	}
 +}
 diff --git a/src/malloc/rpmalloc/rpmalloc.c b/src/malloc/rpmalloc/rpmalloc.c
 new file mode 100644
-index 0000000..cabd4d7
+index 0000000..bcddf3b
 --- /dev/null
 +++ b/src/malloc/rpmalloc/rpmalloc.c
-@@ -0,0 +1,4809 @@
+@@ -0,0 +1,4820 @@
 +/* rpmalloc.c  -  Memory allocator  -  2016-2020 Mattias Jansson
 + *
 + * SPDX-FileCopyrightText: 2016-2020 Mattias Jansson
@@ -1403,6 +1415,17 @@ index 0000000..cabd4d7
 +		*offset = padding;
 +#endif
 +	}
++#if defined(__linux__) || defined(__ANDROID__)
++#  ifndef MADV_NOHUGEPAGE
++#    define MADV_NOHUGEPAGE 15
++#  endif
++	// rpmalloc spans are large and naturally THP-aligned. If transparent huge pages are
++	// enabled system-wide but were not requested by the allocator, keep the kernel from
++	// charging a huge page for the span metadata. This only affects mappings owned by
++	// rpmalloc, not the rest of the process.
++	if (!os_huge_pages && !global_config.enable_thp && (alignment == SPAN_SIZE) && (size == SPAN_SIZE))
++		(void)__madvise(ptr, map_size, MADV_NOHUGEPAGE);
++#endif
 +	*mapped_size = map_size;
 +#if ENABLE_STATISTICS
 +	size_t page_count = map_size / global_config.page_size;
