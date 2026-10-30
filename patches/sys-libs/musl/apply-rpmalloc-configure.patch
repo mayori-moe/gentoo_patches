@@ -1,0 +1,13 @@
+diff --git a/configure b/configure
+index 4a053f1..7be2135 100755
+--- a/configure
++++ b/configure
+@@ -142,7 +142,7 @@ static=yes
+ wrapper=auto
+ gcc_wrapper=no
+ clang_wrapper=no
+-malloc_dir=mallocng
++malloc_dir=rpmalloc
+ 
+ for arg ; do
+ case "$arg" in
