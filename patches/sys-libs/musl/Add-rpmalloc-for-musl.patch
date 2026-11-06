@@ -1,60 +1,25 @@
-From bf1bbcc8a5434352b4a8d6f5f104044d8b5efa05 Mon Sep 17 00:00:00 2001
-From: closure <closure@localhost>
-Date: Fri, 30 Oct 2026 16:38:45 +0800
-Subject: [PATCH] Add rpmalloc 2.0.2 for musl
-Co-Author: DeepSeek-v4.1-Flash
-
-Update the bundled rpmalloc from 1.4.5 to 2.0.2 (develop b8455bb) and adapt the musl integration to the new API: initialize with an empty memory interface, drop the set_main_thread hook, use the new rpmalloc_thread_finalize signature, and keep the per-thread heap and deferred free chain in struct pthread instead of TLS.
-
-Restore the main thread TSD array before using the rpmalloc pthread key. The loader can rebuild the initial TLS after the key was created when a loaded DSO has TLS, leaving the new main thread pthread without a tsd array.
-
-Advise the kernel not to back page-type spans with transparent huge pages unless THP was explicitly requested. With THP set to always, each 256MiB aligned span can otherwise charge a 2MiB huge page for its metadata, adding gigabytes of RSS on systems with many threads. Large/huge block mappings keep THP.
----
- Makefile                       |    2 +-
- README                         |    2 +
- configure                      |    1 +
- ldso/dynlink.c                 |   12 +
- src/env/__libc_start_main.c    |    4 +
- src/internal/pthread_impl.h    |    9 +
- src/malloc/lite_malloc.c       |    5 +
- src/malloc/rpmalloc/glue.h     |   63 +
- src/malloc/rpmalloc/rpmalloc.c | 4820 ++++++++++++++++++++++++++++++++
- src/malloc/rpmalloc/rpmalloc.h |  427 +++
- src/thread/pthread_create.c    |    7 +
- 11 files changed, 5351 insertions(+), 1 deletion(-)
- create mode 100644 src/malloc/rpmalloc/glue.h
- create mode 100644 src/malloc/rpmalloc/rpmalloc.c
- create mode 100644 src/malloc/rpmalloc/rpmalloc.h
-
-diff --git a/Makefile b/Makefile
-index 3ad88b3..e5adff2 100644
---- a/Makefile
-+++ b/Makefile
-@@ -44,7 +44,7 @@ LIBCC = -lgcc
- CPPFLAGS =
- CFLAGS =
- CFLAGS_AUTO = -Os -pipe
--CFLAGS_C99FSE = -std=c99 -ffreestanding -nostdinc 
-+CFLAGS_C99FSE = -std=c99 -ffreestanding -nostdinc -isystem $(shell $(CC) -print-file-name=include)
+diff -ruN a/configure b/configure
+--- a/configure	2026-03-20 23:40:00.000000000 +0800
++++ b/configure	2026-11-06 22:11:39.363025410 +0800
+@@ -36,7 +36,7 @@
+   --disable-static        inhibit building static library [enabled]
  
- CFLAGS_ALL = $(CFLAGS_C99FSE)
- CFLAGS_ALL += -D_XOPEN_SOURCE=700 -I$(srcdir)/arch/$(ARCH) -I$(srcdir)/arch/generic -Iobj/src/internal -I$(srcdir)/src/include -I$(srcdir)/src/internal -Iobj/include -I$(srcdir)/include
-diff --git a/README b/README
-index a30eb11..50f3e8e 100644
---- a/README
-+++ b/README
-@@ -1,4 +1,6 @@
-+musl libc with rpmalloc
+ Optional packages:
+-  --with-malloc=...       choose malloc implementation [mallocng]
++  --with-malloc=...       choose malloc implementation [rpmalloc]
  
-+======
-     musl libc
+ Some influential environment variables:
+   CC                      C compiler command [detected]
+@@ -142,7 +142,7 @@
+ wrapper=auto
+ gcc_wrapper=no
+ clang_wrapper=no
+-malloc_dir=mallocng
++malloc_dir=rpmalloc
  
- musl, pronounced like the word "mussel", is an MIT-licensed
-diff --git a/configure b/configure
-index bc9fbe4..4a053f1 100755
---- a/configure
-+++ b/configure
-@@ -349,6 +349,7 @@ esac
+ for arg ; do
+ case "$arg" in
+@@ -349,6 +349,7 @@
  #
  tryflag CFLAGS_C99FSE -std=c99
  tryflag CFLAGS_C99FSE -nostdinc
@@ -62,23 +27,21 @@ index bc9fbe4..4a053f1 100755
  tryflag CFLAGS_C99FSE -ffreestanding \
  || tryflag CFLAGS_C99FSE -fno-builtin
  tryflag CFLAGS_C99FSE -fexcess-precision=standard \
-diff --git a/ldso/dynlink.c b/ldso/dynlink.c
-index 715948f..5e97a5e 100644
---- a/ldso/dynlink.c
-+++ b/ldso/dynlink.c
-@@ -162,6 +162,7 @@ struct debug *_dl_debug_addr = &debug;
+diff -ruN a/ldso/dynlink.c b/ldso/dynlink.c
+--- a/ldso/dynlink.c	2026-03-20 23:40:00.000000000 +0800
++++ b/ldso/dynlink.c	2026-11-06 22:12:17.010190126 +0800
+@@ -162,6 +162,7 @@
  extern weak hidden char __ehdr_start[];
  
  extern hidden int __malloc_replaced;
-+extern hidden int __malloc_process_init();
++extern hidden int __malloc_process_init(void);
  
  hidden void (*const __init_array_start)(void)=0, (*const __fini_array_start)(void)=0;
  
-@@ -1616,6 +1617,11 @@ static void do_init_fini(struct dso **queue)
+@@ -1616,6 +1617,10 @@
  
  void __libc_start_init(void)
  {
-+	/* Initialize pre process structure of malloc implementation */
 +	if (__malloc_process_init() < 0) {
 +		dprintf(2, "failed to initialize malloc\n");
 +		_exit(127);
@@ -86,11 +49,12 @@ index 715948f..5e97a5e 100644
  	do_init_fini(main_ctor_queue);
  	if (!__malloc_replaced && main_ctor_queue != builtin_ctor_queue)
  		free(main_ctor_queue);
-@@ -1956,6 +1962,12 @@ void __dls3(size_t *sp, size_t *auxv)
+@@ -1956,6 +1961,13 @@
  	reclaim_gaps(&app);
  	reclaim_gaps(&ldso);
  
-+	/* Initialize pre process structure of malloc implementation */
++	/* Initialize the allocator before the loader allocates for preloaded/needed
++	 * libraries. Idempotent; called again once all TLS is in place. */
 +	if (__malloc_process_init() < 0) {
 +		dprintf(2, "%s: failed to initialize malloc\n", argv[0]);
 +		_exit(127);
@@ -99,33 +63,65 @@ index 715948f..5e97a5e 100644
  	/* Load preload/needed libraries, add symbols to global namespace. */
  	ldso.deps = (struct dso **)no_deps;
  	if (env_preload) load_preload(env_preload);
-diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
-index c5b277b..2da2db7 100644
---- a/src/env/__libc_start_main.c
-+++ b/src/env/__libc_start_main.c
+diff -ruN a/Makefile b/Makefile
+--- a/Makefile	2026-03-20 23:40:00.000000000 +0800
++++ b/Makefile	2026-11-06 22:20:46.428860818 +0800
+@@ -17,7 +17,7 @@
+ libdir = $(prefix)/lib
+ syslibdir = /lib
+ 
+-MALLOC_DIR = mallocng
++MALLOC_DIR = rpmalloc
+ SRC_DIRS = $(addprefix $(srcdir)/,src/* src/malloc/$(MALLOC_DIR) crt ldso $(COMPAT_SRC_DIRS))
+ BASE_GLOBS = $(addsuffix /*.c,$(SRC_DIRS))
+ ARCH_GLOBS = $(addsuffix /$(ARCH)/*.[csS],$(SRC_DIRS))
+@@ -44,7 +44,7 @@
+ CPPFLAGS =
+ CFLAGS =
+ CFLAGS_AUTO = -Os -pipe
+-CFLAGS_C99FSE = -std=c99 -ffreestanding -nostdinc 
++CFLAGS_C99FSE = -std=c99 -ffreestanding -nostdinc -isystem $(shell $(CC) -print-file-name=include) 
+ 
+ CFLAGS_ALL = $(CFLAGS_C99FSE)
+ CFLAGS_ALL += -D_XOPEN_SOURCE=700 -I$(srcdir)/arch/$(ARCH) -I$(srcdir)/arch/generic -Iobj/src/internal -I$(srcdir)/src/include -I$(srcdir)/src/internal -Iobj/include -I$(srcdir)/include
+@@ -78,6 +78,13 @@
+ -include config.mak
+ -include $(srcdir)/arch/$(ARCH)/arch.mak
+ 
++# The rpmalloc integration provides the allocator lifecycle hooks itself. Keep
++# lite_malloc.c from defining the weak stubs in that build, so the references
++# from the startup code force rpmalloc.o into static links.
++ifeq ($(MALLOC_DIR),rpmalloc)
++CFLAGS_ALL += -DMUSL_MALLOC_RPMALLOC
++endif
++
+ ifeq ($(ARCH),)
+ 
+ all:
+diff -ruN a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+--- a/src/env/__libc_start_main.c	2026-03-20 23:40:00.000000000 +0800
++++ b/src/env/__libc_start_main.c	2026-11-06 22:11:55.737008697 +0800
 @@ -7,6 +7,8 @@
  #include "atomic.h"
  #include "libc.h"
  
-+extern hidden int __malloc_process_init();
++hidden int __malloc_process_init(void);
 +
  static void dummy(void) {}
  weak_alias(dummy, _init);
  
-@@ -58,6 +60,8 @@ void __init_libc(char **envp, char *pn)
+@@ -58,6 +60,7 @@
  
  static void libc_start_init(void)
  {
-+	/* Initialize pre process structure of malloc implementation */
 +	if (__malloc_process_init() < 0) a_crash();
  	_init();
  	uintptr_t a = (uintptr_t)&__init_array_start;
  	for (; a<(uintptr_t)&__init_array_end; a+=sizeof(void(*)()))
-diff --git a/src/internal/pthread_impl.h b/src/internal/pthread_impl.h
-index de2b9d8..c25aae9 100644
---- a/src/internal/pthread_impl.h
-+++ b/src/internal/pthread_impl.h
-@@ -58,6 +58,15 @@ struct pthread {
+diff -ruN a/src/internal/pthread_impl.h b/src/internal/pthread_impl.h
+--- a/src/internal/pthread_impl.h	2026-03-20 23:40:00.000000000 +0800
++++ b/src/internal/pthread_impl.h	2026-11-06 22:11:33.653666498 +0800
+@@ -58,6 +58,15 @@
  	volatile int killlock[1];
  	char *dlerror_buf;
  	void *stdio_locks;
@@ -141,43 +137,115 @@ index de2b9d8..c25aae9 100644
  
  	/* Part 3 -- the positions of these fields relative to
  	 * the end of the structure is external and internal ABI. */
-diff --git a/src/malloc/lite_malloc.c b/src/malloc/lite_malloc.c
-index 43a988f..ae0f637 100644
---- a/src/malloc/lite_malloc.c
-+++ b/src/malloc/lite_malloc.c
-@@ -116,3 +116,8 @@ static void *default_malloc(size_t n)
+diff -ruN a/src/malloc/lite_malloc.c b/src/malloc/lite_malloc.c
+--- a/src/malloc/lite_malloc.c	2026-03-20 23:40:00.000000000 +0800
++++ b/src/malloc/lite_malloc.c	2026-11-06 22:20:46.430860826 +0800
+@@ -116,3 +116,16 @@
  }
  
  weak_alias(default_malloc, malloc);
 +
-+static void dummy(void) {}
-+weak_alias(dummy, __malloc_process_init);
-+weak_alias(dummy, __malloc_thread_init);
-+weak_alias(dummy, __malloc_thread_finalize);
-diff --git a/src/malloc/rpmalloc/glue.h b/src/malloc/rpmalloc/glue.h
-new file mode 100644
-index 0000000..2f332d9
---- /dev/null
-+++ b/src/malloc/rpmalloc/glue.h
-@@ -0,0 +1,63 @@
-+#include "rpmalloc.h"
-+#if (defined(__GNUC__) && __GNUC__ >= 9)
-+  #pragma GCC diagnostic ignored "-Wattributes"  // or we get warnings that nodiscard is ignored on a forward
-+  #define hidden_alias(fun)   __attribute__((alias(#fun), used, visibility("hidden"), copy(fun)));
-+  #define public_alias(fun)   __attribute__((alias(#fun), used, visibility("default"), copy(fun)));
-+#else
-+  #define hidden_alias(fun)   __attribute__((alias(#fun), used, visibility("hidden")));
-+  #define public_alias(fun)   __attribute__((alias(#fun), used, visibility("default"), copy(fun)));
++/* Hooks implemented by the allocator in src/malloc/$(MALLOC_DIR). The stubs
++ * keep a mallocng/oldmalloc build working, where no allocator lifecycle hooks
++ * are needed. The rpmalloc build intentionally has no stubs: the (strong)
++ * definitions live in rpmalloc.o and must be pulled into static links. */
++#ifndef MUSL_MALLOC_RPMALLOC
++static int dummy_malloc_process_init(void) { return 0; }
++static void dummy_malloc_thread_init(void) { }
++static void dummy_malloc_thread_finalize(void) { }
++weak_alias(dummy_malloc_process_init, __malloc_process_init);
++weak_alias(dummy_malloc_thread_init, __malloc_thread_init);
++weak_alias(dummy_malloc_thread_finalize, __malloc_thread_finalize);
 +#endif
+diff -ruN a/src/malloc/rpmalloc/glue.h b/src/malloc/rpmalloc/glue.h
+--- a/src/malloc/rpmalloc/glue.h	1970-01-01 07:30:00.000000000 +0730
++++ b/src/malloc/rpmalloc/glue.h	2026-11-06 22:23:41.470203153 +0800
+@@ -0,0 +1,137 @@
++#include "rpmalloc.h"
 +
-+void* __libc_malloc_impl(size_t)      hidden_alias(rpmalloc)
-+void* __libc_realloc(void*, size_t)   hidden_alias(rprealloc)
-+void  __libc_free(void*)              hidden_alias(rpfree)
-+void *aligned_alloc(size_t align, size_t size)  public_alias(rpaligned_alloc)
-+size_t malloc_usable_size(void * p)             public_alias(rpmalloc_usable_size)
++hidden extern int __malloc_replaced;
++hidden extern int __aligned_alloc_replaced;
 +
++/* musl's internal entry points. The public malloc/free/realloc wrappers in
++   src/malloc call the __libc_* versions, which must never be interposed.
++   The checks here enforce the libc contract (ENOMEM on failure and on
++   allocation-size overflow) on top of rpmalloc, whose own argument
++   validation is disabled. */
++static void* musl_malloc(size_t size) {
++	if (size >= SIZE_MAX / 2) {
++		errno = ENOMEM;
++		return 0;
++	}
++	void* ptr = rpmalloc(size);
++	if (!ptr)
++		errno = ENOMEM;
++	return ptr;
++}
++
++static void* musl_realloc(void* ptr, size_t size) {
++	if (size >= SIZE_MAX / 2) {
++		errno = ENOMEM;
++		return 0;
++	}
++	void* result = rprealloc(ptr, size);
++	if (!result && size)
++		errno = ENOMEM;
++	return result;
++}
++
++static void* musl_aligned_alloc(size_t alignment, size_t size) {
++	if (alignment & (alignment - 1)) {
++		errno = EINVAL;
++		return 0;
++	}
++	/* rpmalloc guarantees 16 byte alignment for every block. */
++	if (alignment < SMALL_GRANULARITY)
++		alignment = SMALL_GRANULARITY;
++	if (size >= SIZE_MAX / 2) {
++		errno = ENOMEM;
++		return 0;
++	}
++	if (alignment >= RPMALLOC_MAX_ALIGNMENT) {
++		errno = ENOMEM;
++		return 0;
++	}
++	/* If another malloc was interposed but aligned_alloc was not, using the
++	   internal allocator would hand out memory the replacement cannot free.
++	   Match mallocng and refuse the request. */
++	if (__malloc_replaced && !__aligned_alloc_replaced) {
++		errno = ENOMEM;
++		return 0;
++	}
++	void* ptr = rpaligned_alloc(alignment, size);
++	if (!ptr)
++		errno = ENOMEM;
++	return ptr;
++}
++
++hidden void* __libc_malloc_impl(size_t size) {
++	return musl_malloc(size);
++}
++
++hidden void* __libc_realloc(void* ptr, size_t size) {
++	return musl_realloc(ptr, size);
++}
++
++hidden void __libc_free(void* ptr) {
++	rpfree(ptr);
++}
++
++void* aligned_alloc(size_t alignment, size_t size) {
++	return musl_aligned_alloc(alignment, size);
++}
++
++size_t malloc_usable_size(void* ptr) {
++	return rpmalloc_usable_size(ptr);
++}
++
++/* musl hooks. __malloc_replaced stays zero, so the generic calloc wrapper
++   still zeroes the blocks itself. */
 +hidden void __malloc_atfork(int who) {}
-+hidden void __malloc_donate(char *start, char *end) {}
++hidden void __malloc_donate(char* start, char* end) {}
 +hidden int __malloc_process_init() {
 +	return rpmalloc_initialize(0);
 +}
@@ -198,18 +266,19 @@ index 0000000..2f332d9
 +
 +static inline thread_context_t* get_thread_context(void) {
 +	pthread_t self = __pthread_self();
-+	thread_context_t *context = (thread_context_t *)&self->rpmalloc;
-+	if (!context->heap) context->heap = global_heap_default;
++	thread_context_t* context = (thread_context_t*)&self->rpmalloc;
++	if (!context->heap)
++		context->heap = global_heap_default;
 +	return context;
 +}
 +
 +static inline uintptr_t get_thread_id(void) {
 +	pthread_t self = __pthread_self();
-+	return (uintptr_t) self;
++	return (uintptr_t)self;
 +}
 +
 +static void set_thread_heap(heap_t* heap) {
-+	thread_context_t *context = get_thread_context();
++	thread_context_t* context = get_thread_context();
 +	context->heap = heap;
 +	if (heap && heap->id)
 +		heap->owner_thread = get_thread_id();
@@ -219,16 +288,20 @@ index 0000000..2f332d9
 +		   created (when a loaded DSO has TLS), leaving the new main thread
 +		   pthread without a TSD array. Restore the one pthread_key_create
 +		   would have used. */
-+		if (!self->tsd) self->tsd = __pthread_tsd_main;
-+		pthread_setspecific(pthread_key, heap);
++		if (!self->tsd)
++			self->tsd = __pthread_tsd_main;
++		/* Equivalent to pthread_setspecific, without a call to an
++		   interposable public entry point. */
++		if (self->tsd[pthread_key] != (void*)heap) {
++			self->tsd[pthread_key] = heap;
++			self->tsd_used = 1;
++		}
 +	}
 +}
-diff --git a/src/malloc/rpmalloc/rpmalloc.c b/src/malloc/rpmalloc/rpmalloc.c
-new file mode 100644
-index 0000000..bcddf3b
---- /dev/null
-+++ b/src/malloc/rpmalloc/rpmalloc.c
-@@ -0,0 +1,4820 @@
+diff -ruN a/src/malloc/rpmalloc/rpmalloc.c b/src/malloc/rpmalloc/rpmalloc.c
+--- a/src/malloc/rpmalloc/rpmalloc.c	1970-01-01 07:30:00.000000000 +0730
++++ b/src/malloc/rpmalloc/rpmalloc.c	2026-11-06 22:23:36.553201706 +0800
+@@ -0,0 +1,4857 @@
 +/* rpmalloc.c  -  Memory allocator  -  2016-2020 Mattias Jansson
 + *
 + * SPDX-FileCopyrightText: 2016-2020 Mattias Jansson
@@ -332,6 +405,17 @@ index 0000000..bcddf3b
 +#ifndef MAP_UNINITIALIZED
 +#define MAP_UNINITIALIZED 0
 +#endif
++#endif
++
++#if defined(MUSL_MALLOC_RPMALLOC)
++/* Built into musl: use the hidden internal aliases so the allocator can never
++   recurse through an interposed libc entry point (for example an application
++   mmap that itself allocates) and does not pay for PLT indirection. */
++#define mmap __mmap
++#define munmap __munmap
++#define madvise __madvise
++#define pthread_key_create __pthread_key_create
++#define pthread_key_delete __pthread_key_delete
 +#endif
 +
 +#if defined(__linux__) || defined(__ANDROID__)
@@ -676,6 +760,13 @@ index 0000000..bcddf3b
 +#ifndef WAIT_SPIN_YIELD_THRESHOLD
 +//! Number of cheap CPU-pause spins before wait_spin escalates to a real OS scheduler yield.
 +#define WAIT_SPIN_YIELD_THRESHOLD 100
++#endif
++
++#ifndef RPMALLOC_HEAP_CREATE_WAIT_MS
++//! Milliseconds a thread waits for another thread's heap block creation before assuming it was
++//  cancelled or wedged and mapping its own block. Only used when a block is carved into more than
++//  one heap, see heap_allocate_new
++#define RPMALLOC_HEAP_CREATE_WAIT_MS 5000
 +#endif
 +
 +static inline void
@@ -1416,9 +1507,9 @@ index 0000000..bcddf3b
 +#endif
 +	}
 +#if defined(__linux__) || defined(__ANDROID__)
-+#  ifndef MADV_NOHUGEPAGE
-+#    define MADV_NOHUGEPAGE 15
-+#  endif
++#if !defined(MADV_NOHUGEPAGE)
++#define MADV_NOHUGEPAGE 15
++#endif
 +	// rpmalloc spans are large and naturally THP-aligned. If transparent huge pages are
 +	// enabled system-wide but were not requested by the allocator, keep the kernel from
 +	// charging a huge page for the span metadata. This only affects mappings owned by
@@ -2918,19 +3009,28 @@ index 0000000..bcddf3b
 +// pages, committing) a whole page per heap. Only the first heap records the mapping offset and
 +// size; it owns the shared mapping and is the one heap that unmaps it at finalize.
 +//
-+// Block creation is serialized through global_heap_creating: when no heap is available, one thread
-+// maps and carves a block while concurrent thread starts wait for the carved heaps to be published,
-+// so a startup burst maps a single block instead of one block per thread. Ordinary requests reuse a
-+// released heap first, then a pristine carved one. First-class requests need a heap with no prior
-+// allocations, so they take only pristine heaps (a carved extra, or a freshly mapped master), never
-+// a released one, but still wait so they do not map concurrently with another creation.
++// A heap block is a page-aligned mapping carved into block_size / aligned_heap_size heap
++// structures. Serializing creation through global_heap_creating only helps when the block holds
++// more than one heap, so a startup burst shares one mapping. With a single heap per block (4 KiB
++// pages with the current heap structure) waiting buys nothing, and a creator cancelled or gone
++// between setting and clearing the flag would block every other thread forever, so that case
++// never waits. When carving does produce extras the wait is bounded: after
++// RPMALLOC_HEAP_CREATE_WAIT_MS the creator is assumed wedged and the waiter maps its own block.
++// Ordinary requests reuse a released heap first, then a pristine carved one. First-class requests
++// need a heap with no prior allocations, so they take only pristine heaps (a carved extra, or a
++// freshly mapped master), never a released one.
 +static heap_t*
 +heap_allocate_new(int first_class) {
 +	if (!global_config.page_size)
 +		rpmalloc_initialize(0);
 +
++	size_t aligned_heap_size = HEAP_ALIGNMENT * ((sizeof(heap_t) + (HEAP_ALIGNMENT - 1)) / HEAP_ALIGNMENT);
++	size_t block_size = get_page_aligned_size(aligned_heap_size);
++	const int serialize_creation = (block_size / aligned_heap_size) > 1;
++
 +	heap_lock_acquire();
 +	uint32_t spin = 0;
++	uint64_t creating_since = 0;
 +	while (1) {
 +		if (!first_class && global_heap_queue) {
 +			heap_t* heap = global_heap_queue;
@@ -2952,8 +3052,17 @@ index 0000000..bcddf3b
 +			heap_lock_release();
 +			return heap;
 +		}
-+		if (!global_heap_creating)
++		if (!serialize_creation || !global_heap_creating)
 +			break;
++		if (!creating_since) {
++			creating_since = monotonic_time_ms();
++		} else if ((monotonic_time_ms() - creating_since) >= RPMALLOC_HEAP_CREATE_WAIT_MS) {
++			// The creator is gone or wedged. Taking over is safe: mappings are independent,
++			// and the shared pools are only modified while holding the heap lock.
++			global_heap_creating = 0;
++			creating_since = 0;
++			break;
++		}
 +		heap_lock_release();
 +		wait_spin(&spin);
 +		heap_lock_acquire();
@@ -2961,8 +3070,6 @@ index 0000000..bcddf3b
 +	global_heap_creating = 1;
 +	heap_lock_release();
 +
-+	size_t aligned_heap_size = HEAP_ALIGNMENT * ((sizeof(heap_t) + (HEAP_ALIGNMENT - 1)) / HEAP_ALIGNMENT);
-+	size_t block_size = get_page_aligned_size(aligned_heap_size);
 +	size_t offset = 0;
 +	size_t mapped_size = 0;
 +	block_t* block = memory_interface_map(block_size, 0, &offset, &mapped_size);
@@ -4257,8 +4364,11 @@ index 0000000..bcddf3b
 +#endif
 +#endif
 +
-+#if PLATFORM_POSIX && (defined(__GNUC__) || defined(__clang__))
-+//! Delete the thread destructor key when the module is unloaded, without finalizing as the module can still allocate
++#if PLATFORM_POSIX && ENABLE_DYNAMIC_LINK && (defined(__GNUC__) || defined(__clang__))
++//! Delete the thread destructor key when the module is unloaded, without finalizing as the module can still allocate.
++//  A libc is never unloaded, and running pthread_key_delete while other threads are still
++//  exiting would race on musl's key lock and thread list lock, so it is only emitted for a
++//  dynamically loaded rpmalloc module.
 +__attribute__((destructor)) static void
 +rpmalloc_module_detach(void) {
 +	global_module_detached = 1;
@@ -5049,12 +5159,10 @@ index 0000000..bcddf3b
 +#endif
 +
 +#include "glue.h"
-diff --git a/src/malloc/rpmalloc/rpmalloc.h b/src/malloc/rpmalloc/rpmalloc.h
-new file mode 100644
-index 0000000..396911c
---- /dev/null
-+++ b/src/malloc/rpmalloc/rpmalloc.h
-@@ -0,0 +1,427 @@
+diff -ruN a/src/malloc/rpmalloc/rpmalloc.h b/src/malloc/rpmalloc/rpmalloc.h
+--- a/src/malloc/rpmalloc/rpmalloc.h	1970-01-01 07:30:00.000000000 +0730
++++ b/src/malloc/rpmalloc/rpmalloc.h	2026-11-06 22:10:47.228127125 +0800
+@@ -0,0 +1,428 @@
 +/* rpmalloc.h  -  Memory allocator  -  2016-2024 Mattias Jansson
 + *
 + * SPDX-FileCopyrightText: 2016-2024 Mattias Jansson
@@ -5091,6 +5199,7 @@ index 0000000..396911c
 +
 +#define RPMALLOC_CACHE_LINE_SIZE 64
 +#if defined(__clang__) || defined(__GNUC__)
++/* Built directly into libc: keep every entry point local to rpmalloc.c. */
 +#define RPMALLOC_EXPORT static
 +#define RPMALLOC_RESTRICT __restrict
 +#define RPMALLOC_ALLOCATOR
@@ -5482,21 +5591,20 @@ index 0000000..396911c
 +#ifdef __cplusplus
 +}
 +#endif
-diff --git a/src/thread/pthread_create.c b/src/thread/pthread_create.c
-index 087f620..3d882d1 100644
---- a/src/thread/pthread_create.c
-+++ b/src/thread/pthread_create.c
+diff -ruN a/src/thread/pthread_create.c b/src/thread/pthread_create.c
+--- a/src/thread/pthread_create.c	2026-03-20 23:40:00.000000000 +0800
++++ b/src/thread/pthread_create.c	2026-11-06 22:21:29.483010351 +0800
 @@ -7,6 +7,9 @@
  #include <string.h>
  #include <stddef.h>
  
-+hidden void __malloc_thread_init();
-+hidden void __malloc_thread_finalize();
++hidden void __malloc_thread_init(void);
++hidden void __malloc_thread_finalize(void);
 +
  static void dummy_0()
  {
  }
-@@ -69,6 +72,8 @@ _Noreturn void __pthread_exit(void *result)
+@@ -69,6 +72,8 @@
  
  	__pthread_tsd_run_dtors();
  
@@ -5505,7 +5613,7 @@ index 087f620..3d882d1 100644
  	__block_app_sigs(&set);
  
  	/* This atomic potentially competes with a concurrent pthread_detach
-@@ -204,6 +209,7 @@ static int start(void *p)
+@@ -204,6 +209,7 @@
  		}
  	}
  	__syscall(SYS_rt_sigprocmask, SIG_SETMASK, &args->sig_mask, 0, _NSIG/8);
@@ -5513,7 +5621,7 @@ index 087f620..3d882d1 100644
  	__pthread_exit(args->start_func(args->start_arg));
  	return 0;
  }
-@@ -212,6 +218,7 @@ static int start_c11(void *p)
+@@ -212,6 +218,7 @@
  {
  	struct start_args *args = p;
  	int (*start)(void*) = (int(*)(void*)) args->start_func;
@@ -5521,6 +5629,3 @@ index 087f620..3d882d1 100644
  	__pthread_exit((void *)(uintptr_t)start(args->start_arg));
  	return 0;
  }
--- 
-2.56.0
-
