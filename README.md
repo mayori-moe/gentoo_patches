@@ -30,4 +30,10 @@ See [RDTSC-KVM-Handler](https://github.com/WCharacter/RDTSC-KVM-Handler); anti-d
 - `rtkit/sched_getscheduler_sched_setscheduler.patch`:
 See [Gentoo Bugs 980022](https://bugs.gentoo.org/980022) and [this patch](https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/rtkit/sched_getscheduler_sched_setscheduler.patch) from Alpine Linux for fixing some issues under musl.
 
+- `kde-plasma/layer-shell-qt/layer-shell-qt-llvm-abi.patch && dev-qt/qtbase/qtbase-fix-llvm-abi.patch`
+See [Gentoo Bugs 923292](https://bugs.gentoo.org/923292). Patches adapted from FreeBSD patches, according to [this comment](https://bugs.kde.org/show_bug.cgi?id=479679#c28) of KDE Bugs 479679. If you don't want to use this patch, provide an `env` file for `llvm-runtimes/libcxx` contains `MYCMAKEARGS="-DLIBCXX_TYPEINFO_COMPARISON_IMPLEMENTATION=2"` then rebuild all packages.
+
+- `net-analyzer/openbsd-netcat/netcat-define-IPTOS_DSCP_VA-for-musl.patch`
+See [Gentoo Bugs 981134](https://bugs.gentoo.org/981134). Patch for the MACRO not defined in musl.
+
 If you are having problems when using a musl profile, searching about related packages or patches on Gentoo Bugs/Void Linux/Alpine Linux/Chimera Linux is helpful, and you can find lots of useful patches there.
